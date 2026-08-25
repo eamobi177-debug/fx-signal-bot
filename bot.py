@@ -1,13 +1,14 @@
 """
 FX Signal Bot
-- Pick currency pair & timeframe via tappable buttons
+- Pick one or more currency pairs (multi-select) and a timeframe via buttons
 - Sends BUY/SELL signal alerts when EMA+RSI strategy fires on a closed candle
-- Tracks win/loss outcome of each signal and shows a running tally
-- /backtest shows historical win rate for the selected pair/timeframe
+- Tracks win/loss outcome of each signal per pair, with a running tally
+- /backtest shows historical win rate for a chosen pair/timeframe
 - This bot is for SIGNAL ALERTS ONLY. It does not place trades.
 """
 import os
 import logging
+from datetime import datetime, timezone
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
@@ -36,8 +37,15 @@ TIMEFRAMES = list(TIMEFRAME_MAP.keys())
 chat_state = {}
 
 
-def pair_keyboard():
-    rows = [[InlineKeyboardButton(p, callback_data=f"pair:{p}")] for p in PAIRS]
+def pair_selection_keyboard(selected):
+    rows = []
+    all_selected = set(PAIRS).issubset(selected)
+    all_mark = "✅ " if all_selected else ""
+    rows.append([InlineKeyboardButton(f"{all_mark}All Pairs", callback_data="pairtoggle:ALL")])
+    for p in PAIRS:
+        mark = "✅ " if p in selected else ""
+        rows.append([InlineKeyboardButton(f"{mark}{p}", callback_data=f"pairtoggle:{p}")])
+    rows.append([InlineKeyboardButton("Done ➜", callback_data="pairsdone")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -47,6 +55,8 @@ def timeframe_keyboard():
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    chat_state[chat_id] = {"selecting_pairs": set(), "timeframe": None, "pairs": {}}
     text = (
         "Welcome to your FX Signal Bot.\n\n"
         "This bot sends BUY/SELL alerts based on an EMA+RSI strategy on "
@@ -54,9 +64,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "the alerts yourself.\n\n"
         "No strategy wins every time. Use /backtest before trusting live "
         "alerts with real money.\n\n"
-        "Pick a currency pair to begin:"
+        "Tap to select one or more currency pairs, then tap Done:"
     )
-    await update.message.reply_text(text, reply_markup=pair_keyboard())
+    await update.message.reply_text(text, reply_markup=pair_selection_keyboard(set()))
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -64,70 +74,101 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     chat_id = query.message.chat_id
     data_str = query.data
+    state = chat_state.setdefault(chat_id, {"selecting_pairs": set(), "timeframe": None, "pairs": {}})
 
-    if data_str.startswith("pair:"):
+    if data_str.startswith("pairtoggle:"):
         pair = data_str.split(":", 1)[1]
-        chat_state.setdefault(chat_id, {})["pair"] = pair
+        selected = state.setdefault("selecting_pairs", set())
+        if pair == "ALL":
+            if set(PAIRS).issubset(selected):
+                selected.clear()
+            else:
+                selected.update(PAIRS)
+        elif pair in selected:
+            selected.remove(pair)
+        else:
+            selected.add(pair)
         await query.edit_message_text(
-            f"Pair set to {pair}.\n\nNow pick a timeframe:",
+            "Tap to select one or more currency pairs, then tap Done:",
+            reply_markup=pair_selection_keyboard(selected),
+        )
+
+    elif data_str == "pairsdone":
+        selected = state.get("selecting_pairs", set())
+        if not selected:
+            await query.answer("Pick at least one pair first.", show_alert=True)
+            return
+        await query.edit_message_text(
+            f"Pairs selected: {', '.join(sorted(selected))}\n\nNow pick a timeframe:",
             reply_markup=timeframe_keyboard(),
         )
 
     elif data_str.startswith("tf:"):
         tf = data_str.split(":", 1)[1]
-        state = chat_state.setdefault(chat_id, {})
+        selected_pairs = state.get("selecting_pairs", set())
         state["timeframe"] = tf
-        state["last_len"] = None
-        state["pending_signal"] = None
-        state["wins"] = 0
-        state["losses"] = 0
-        pair = state.get("pair", "GBP/USD")
+        state["pairs"] = {
+            p: {"last_len": None, "pending_signal": None, "wins": 0, "losses": 0}
+            for p in selected_pairs
+        }
 
-        job_name = f"poll_{chat_id}"
-        current_jobs = context.job_queue.get_jobs_by_name(job_name)
-        for j in current_jobs:
-            j.schedule_removal()
-        interval = POLL_SECONDS.get(tf, 30)
-        context.job_queue.run_repeating(
-            poll_and_alert, interval=interval, first=5,
-            data={"chat_id": chat_id}, name=job_name,
-        )
+        for j in context.job_queue.jobs():
+            if j.name and j.name.startswith(f"poll_{chat_id}_"):
+                j.schedule_removal()
 
+        n = max(1, len(selected_pairs))
+        interval = POLL_SECONDS.get(tf, 30) * n
+        for i, pair in enumerate(sorted(selected_pairs)):
+            job_name = f"poll_{chat_id}_{pair}"
+            context.job_queue.run_repeating(
+                poll_and_alert,
+                interval=interval,
+                first=5 + i * 5,
+                data={"chat_id": chat_id, "pair": pair},
+                name=job_name,
+            )
+
+        pairs_list = ", ".join(sorted(selected_pairs))
         await query.edit_message_text(
-            f"✅ Watching {pair} on {tf}.\n\n"
-            f"You'll get an alert here when a signal fires, and a "
-            f"WIN/LOSS result with running tally after each one closes.\n\n"
+            f"✅ Watching {pairs_list} on {tf}.\n\n"
+            f"You'll get an alert here when a signal fires on any of them, "
+            f"and a WIN/LOSS result with running tally after each one closes.\n\n"
             f"Commands:\n"
-            f"/backtest — see historical win rate for this pair/timeframe\n"
-            f"/change — pick a different pair or timeframe\n"
-            f"/stop — stop alerts"
+            f"/status — check the bot is alive and see what it's seeing\n"
+            f"/backtest — see historical win rate (uses your first selected pair)\n"
+            f"/change — pick different pairs or timeframe\n"
+            f"/stop — stop all alerts"
         )
 
 
 async def change(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Pick a currency pair:", reply_markup=pair_keyboard())
+    chat_id = update.effective_chat.id
+    chat_state[chat_id] = {"selecting_pairs": set(), "timeframe": None, "pairs": {}}
+    await update.message.reply_text(
+        "Tap to select one or more currency pairs, then tap Done:",
+        reply_markup=pair_selection_keyboard(set()),
+    )
 
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    job_name = f"poll_{chat_id}"
-    jobs = context.job_queue.get_jobs_by_name(job_name)
-    for j in jobs:
-        j.schedule_removal()
+    for j in context.job_queue.jobs():
+        if j.name and j.name.startswith(f"poll_{chat_id}_"):
+            j.schedule_removal()
     await update.message.reply_text("Alerts stopped. Send /start to begin again.")
 
 
 async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     state = chat_state.get(chat_id)
-    if not state or "pair" not in state or "timeframe" not in state:
+    if not state or not state.get("pairs") or not state.get("timeframe"):
         await update.message.reply_text(
-            "Pick a pair and timeframe first with /start."
+            "Pick your pairs and timeframe first with /start."
         )
         return
 
-    pair = state["pair"]
     tf = state["timeframe"]
+    pair = sorted(state["pairs"].keys())[0]
     await update.message.reply_text(f"Running backtest for {pair} on {tf}... one moment.")
 
     closes, err = fetch_closes(pair, tf, outputsize=500)
@@ -158,19 +199,59 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    state = chat_state.get(chat_id)
+    if not state or not state.get("pairs"):
+        await update.message.reply_text(
+            "Not watching anything right now. Send /start to begin."
+        )
+        return
+
+    tf = state.get("timeframe", "?")
+    lines = [f"📡 Status — timeframe {tf}\n"]
+    now = datetime.now(timezone.utc)
+    for pair, pdata in sorted(state["pairs"].items()):
+        last_checked = pdata.get("last_checked")
+        if last_checked:
+            secs_ago = int((now - last_checked).total_seconds())
+            checked_str = f"{secs_ago}s ago"
+        else:
+            checked_str = "not checked yet"
+
+        err = pdata.get("last_error")
+        health = f"⚠️ {err}" if err else "OK"
+
+        wins = pdata.get("wins", 0)
+        losses = pdata.get("losses", 0)
+        pending = "yes" if pdata.get("pending_signal") else "no"
+
+        lines.append(
+            f"{pair}: last checked {checked_str} — {health}\n"
+            f"  Pending signal: {pending} | Record: {wins}W/{losses}L"
+        )
+
+    await update.message.reply_text("\n".join(lines))
+
+
 async def poll_and_alert(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
     chat_id = job.data["chat_id"]
-    state = chat_state.get(chat_id)
-    if not state:
+    pair = job.data["pair"]
+    chat = chat_state.get(chat_id)
+    if not chat or pair not in chat.get("pairs", {}):
         return
 
-    pair = state["pair"]
-    tf = state["timeframe"]
+    state = chat["pairs"][pair]
+    tf = chat["timeframe"]
+
+    state["last_checked"] = datetime.now(timezone.utc)
 
     closes, err = fetch_closes(pair, tf, outputsize=100)
     if err or not closes:
+        state["last_error"] = err or "No data returned"
         return
+    state["last_error"] = None
 
     if state.get("last_len") == len(closes):
         return
@@ -199,7 +280,7 @@ async def poll_and_alert(context: ContextTypes.DEFAULT_TYPE):
         result_text = (
             f"{result_word} — {action} {pending['pair']} ({pending['tf']})\n"
             f"Entry: {pending['entry_price']} → Exit: {exit_price}\n\n"
-            f"📊 Running total: {wins}W / {losses}L ({win_rate}% win rate)"
+            f"📊 Running total for {pending['pair']}: {wins}W / {losses}L ({win_rate}% win rate)"
         )
         await context.bot.send_message(chat_id=chat_id, text=result_text)
         state["pending_signal"] = None
@@ -240,6 +321,7 @@ def main():
     app.add_handler(CommandHandler("change", change))
     app.add_handler(CommandHandler("stop", stop))
     app.add_handler(CommandHandler("backtest", backtest_cmd))
+    app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CallbackQueryHandler(button_handler))
 
     logger.info("Bot starting...")
