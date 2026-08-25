@@ -2,6 +2,7 @@
 FX Signal Bot
 - Pick currency pair & timeframe via tappable buttons
 - Sends BUY/SELL signal alerts when EMA+RSI strategy fires on a closed candle
+- Tracks win/loss outcome of each signal and shows a running tally
 - /backtest shows historical win rate for the selected pair/timeframe
 - This bot is for SIGNAL ALERTS ONLY. It does not place trades.
 """
@@ -77,6 +78,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state = chat_state.setdefault(chat_id, {})
         state["timeframe"] = tf
         state["last_len"] = None
+        state["pending_signal"] = None
+        state["wins"] = 0
+        state["losses"] = 0
         pair = state.get("pair", "GBP/USD")
 
         job_name = f"poll_{chat_id}"
@@ -91,7 +95,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await query.edit_message_text(
             f"✅ Watching {pair} on {tf}.\n\n"
-            f"You'll get an alert here when a signal fires.\n\n"
+            f"You'll get an alert here when a signal fires, and a "
+            f"WIN/LOSS result with running tally after each one closes.\n\n"
             f"Commands:\n"
             f"/backtest — see historical win rate for this pair/timeframe\n"
             f"/change — pick a different pair or timeframe\n"
@@ -171,6 +176,34 @@ async def poll_and_alert(context: ContextTypes.DEFAULT_TYPE):
         return
     state["last_len"] = len(closes)
 
+    pending = state.get("pending_signal")
+    if pending:
+        exit_price = closes[-1]
+        won = (
+            (pending["direction"] == "UP" and exit_price > pending["entry_price"])
+            or (pending["direction"] == "DOWN" and exit_price < pending["entry_price"])
+        )
+        if won:
+            state["wins"] = state.get("wins", 0) + 1
+            result_word = "✅ WIN"
+        else:
+            state["losses"] = state.get("losses", 0) + 1
+            result_word = "❌ LOSS"
+
+        action = "BUY" if pending["direction"] == "UP" else "SELL"
+        wins = state.get("wins", 0)
+        losses = state.get("losses", 0)
+        total = wins + losses
+        win_rate = round(wins / total * 100, 1) if total > 0 else 0
+
+        result_text = (
+            f"{result_word} — {action} {pending['pair']} ({pending['tf']})\n"
+            f"Entry: {pending['entry_price']} → Exit: {exit_price}\n\n"
+            f"📊 Running total: {wins}W / {losses}L ({win_rate}% win rate)"
+        )
+        await context.bot.send_message(chat_id=chat_id, text=result_text)
+        state["pending_signal"] = None
+
     signal, rsi_value = generate_signal(closes)
     if signal is None:
         return
@@ -189,6 +222,13 @@ async def poll_and_alert(context: ContextTypes.DEFAULT_TYPE):
         f"Signal only — place the trade yourself if you choose to act on it."
     )
     await context.bot.send_message(chat_id=chat_id, text=text)
+
+    state["pending_signal"] = {
+        "direction": signal,
+        "entry_price": price,
+        "pair": pair,
+        "tf": tf,
+    }
 
 
 def main():
