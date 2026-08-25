@@ -39,12 +39,15 @@ def rsi(values, period=14):
     return rsi_values[:len(values)]
 
 
-def generate_signal(closes, ema_fast=9, ema_slow=21, rsi_period=14,
+def generate_signal(closes, ema_fast=5, ema_slow=13, rsi_period=14,
                      rsi_upper=60, rsi_lower=40):
     """
     Given a list of closing prices (oldest -> newest), return:
       "UP", "DOWN", or None (no signal)
     based on the most recently closed candle.
+
+    Logic: EMA5 crosses above/below EMA13 on the last candle,
+    AND RSI confirms momentum in that direction (filters weak crossovers).
     """
     if len(closes) < ema_slow + 2:
         return None, None
